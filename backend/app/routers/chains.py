@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
+from app.backfill import normalize_mode_input
 from app.services import service_for
 
 router = APIRouter(prefix="/api/chains", tags=["业务链路"])
@@ -110,9 +111,23 @@ def chain_storage_optimize(table_id: int, merge_id: int, compaction_id: int) -> 
 # ------------------------------------------------------------------
 
 @router.post("/schema-evolve")
-def chain_schema_evolve(schema_id: int, backfill_id: int, merge_id: int, checkpoint_id: int) -> dict:
-    """Schema演进链路：Schema演进 → 数据回填 → 批流合并 → 保存检查点。"""
+def chain_schema_evolve(
+    schema_id: int,
+    backfill_id: int,
+    merge_id: int,
+    checkpoint_id: int,
+    delivery_mode: str | None = None,
+) -> dict:
+    """Schema演进链路：Schema演进 → 数据回填 → 批流合并 → 保存检查点。
+
+    回填到合并的交接以逐分区实际结果为准：合并入口只接收回填侧确认交付的分区，
+    失败 / 无产出分区作为拒绝依据保留，不会让整条链路误报完成交付。
+    """
     steps = []
+    mode, mode_error = normalize_mode_input(delivery_mode)
+    if mode_error:
+        raise HTTPException(400, mode_error)
+    delivery_mode = mode
 
     # Step 1: Schema演进
     svc_schema = service_for("stream_schema")
@@ -123,20 +138,22 @@ def chain_schema_evolve(schema_id: int, backfill_id: int, merge_id: int, checkpo
     if not r1["ok"]:
         return {"chain": "schema-evolve", "ok": False, "steps": steps, "error": r1.get("message")}
 
-    # Step 2: 数据回填
+    # Step 2: 数据回填（进度 / 可用范围来自逐分区实际结果）
     svc_backfill = service_for("backfill_pipeline")
     if not svc_backfill:
         raise HTTPException(404, "backfill_pipeline 服务未注册")
-    r2 = svc_backfill.domain_backfill(backfill_id)
+    r2 = svc_backfill.domain_backfill(backfill_id, delivery_mode)
     steps.append({"step": "data_backfill", "ok": r2["ok"], "details": r2})
     if not r2["ok"]:
         return {"chain": "schema-evolve", "ok": False, "steps": steps, "error": r2.get("message")}
 
-    # Step 3: 批流合并
+    # Step 3: 批流合并（以回填交付边界为输入，拒绝无产出 / 失效分区）
     svc_merge = service_for("batch_merge")
     if not svc_merge:
         raise HTTPException(404, "batch_merge 服务未注册")
-    r3 = svc_merge.domain_merge_batch_stream(merge_id)
+    r3 = svc_merge.domain_merge_batch_stream(
+        merge_id, backfill_id=backfill_id, delivery_mode=delivery_mode,
+    )
     steps.append({"step": "batch_stream_merge", "ok": r3["ok"], "details": r3})
     if not r3["ok"]:
         return {"chain": "schema-evolve", "ok": False, "steps": steps, "error": r3.get("message")}
@@ -148,9 +165,20 @@ def chain_schema_evolve(schema_id: int, backfill_id: int, merge_id: int, checkpo
     r4 = svc_ckpt.domain_save_checkpoint(checkpoint_id)
     steps.append({"step": "save_checkpoint", "ok": r4["ok"], "details": r4})
 
+    boundary = r2.get("delivery_boundary") or {}
     return {"chain": "schema-evolve", "ok": True, "steps": steps, "summary": {
         "schema_version": r1.get("evolved_version"),
         "backfill_rows": r2.get("completed_rows"),
+        "backfill_complete": r2.get("complete", False),
+        "backfill_progress_percent": r2.get("progress_percent"),
+        "usable_backfill_range": r2.get("usable_backfill_range", []),
+        "failed_partitions": r2.get("failed_partition_names", []),
+        "delivery_mode": boundary.get("mode"),
+        "delivered_partitions": boundary.get("delivered_partitions", []),
+        "held_partitions": boundary.get("held_partitions", []),
+        "next_batch_read_scope": boundary.get("next_batch_read_scope", []),
+        "merge_todos": r3.get("merge_todos", []),
+        "delivery_complete": bool(boundary.get("complete")) and not r3.get("merge_todos"),
         "reconciled_total": r3.get("reconciled_total"),
         "checkpoint": r4.get("checkpoint_id"),
     }}

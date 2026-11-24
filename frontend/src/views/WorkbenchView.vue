@@ -28,6 +28,139 @@
       </span>
     </p>
 
+    <section
+      v-if="isBackfill || isBatchMerge"
+      class="delivery-panel"
+      data-testid="delivery-panel"
+    >
+      <header class="delivery-head">
+        <div>
+          <h3>{{ isBackfill ? '逐分区回填进度与交付边界' : '合并入口交付边界' }}</h3>
+          <p class="page-desc">
+            进度与可用回填数据范围来自逐分区实际结果；失败 / 无产出分区只保留依据，不计入完成。
+          </p>
+        </div>
+        <div class="delivery-controls">
+          <label v-if="isBatchMerge" class="filter-item">
+            <span>回填任务 ID</span>
+            <input v-model="linkedBackfillId" data-testid="linked-backfill" placeholder="如 1" />
+          </label>
+          <label class="filter-item">
+            <span>交付口径</span>
+            <select v-model="deliveryMode" data-testid="delivery-mode">
+              <option value="">按任务配置</option>
+              <option value="partition">按分区交付</option>
+              <option value="batch">整批确认</option>
+            </select>
+          </label>
+          <button class="btn" data-testid="load-delivery" type="button" @click="loadDelivery()">
+            查看交付边界
+          </button>
+        </div>
+      </header>
+
+      <p v-if="deliveryMessage" class="error-text" data-testid="delivery-message">{{ deliveryMessage }}</p>
+
+      <template v-if="backfillDetail">
+        <div class="progress-row">
+          <div class="progress-track">
+            <div
+              class="progress-fill"
+              :class="{ complete: backfillDetail.complete }"
+              :style="{ width: `${backfillDetail.progress_percent}%` }"
+              data-testid="backfill-progress"
+            />
+          </div>
+          <strong data-testid="backfill-progress-value">{{ backfillDetail.progress_percent }}%</strong>
+          <span class="progress-basis">{{ backfillDetail.progress_basis }}</span>
+        </div>
+        <div class="delivery-grid">
+          <div>
+            <h4>可用回填数据范围</h4>
+            <p data-testid="usable-range">
+              {{ backfillDetail.usable_backfill_range.join('、') || '（无）' }}
+              · {{ backfillDetail.usable_rows }} 行
+            </p>
+          </div>
+          <div>
+            <h4>本批交付 / 留在回填侧</h4>
+            <p data-testid="delivery-split">
+              交付：{{ backfillDetail.delivered_partitions.join('、') || '（无）' }} ·
+              留待：{{ backfillDetail.held_partitions.join('、') || '（无）' }}
+            </p>
+            <p class="page-desc" data-testid="delivery-reason">
+              {{ backfillDetail.delivery_boundary.reason }}
+            </p>
+          </div>
+          <div>
+            <h4>下一批读取范围</h4>
+            <p data-testid="next-scope">{{ backfillDetail.next_batch_read_scope.join('、') || '（无）' }}</p>
+          </div>
+        </div>
+        <table class="data-table partition-table">
+          <thead>
+            <tr>
+              <th>分区</th>
+              <th>状态</th>
+              <th>实际行数</th>
+              <th>交付</th>
+              <th>依据</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="item in backfillDetail.usable_range_detail"
+              :key="item.partition"
+              :data-testid="`partition-${item.partition}`"
+            >
+              <td>{{ item.partition }}</td>
+              <td>{{ item.status }}</td>
+              <td>{{ item.rows }}</td>
+              <td>{{ item.delivered ? '已交付' : item.usable ? '留在回填侧' : '拒绝' }}</td>
+              <td>{{ item.basis }}：{{ item.reason }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-if="backfillDetail.merge_todos.length" class="todo-list" data-testid="merge-todos">
+          <span v-for="(item, index) in backfillDetail.merge_todos" :key="index" class="todo-item">
+            {{ item.todo }}
+          </span>
+        </p>
+      </template>
+
+      <template v-else-if="mergeDelivery">
+        <div class="delivery-grid">
+          <div>
+            <h4>合并入口接收</h4>
+            <p data-testid="merge-accepted">
+              {{ mergeDelivery.accepted_partitions.join('、') || '（无）' }}
+            </p>
+          </div>
+          <div>
+            <h4>拒绝的失效范围</h4>
+            <p data-testid="merge-rejected">
+              {{
+                mergeDelivery.rejected_partitions.map((item) => `${item.partition}(${item.status})`).join('、') ||
+                '（无）'
+              }}
+            </p>
+          </div>
+          <div>
+            <h4>下一批读取范围</h4>
+            <p data-testid="merge-next-scope">
+              {{ mergeDelivery.next_batch_read_scope.join('、') || '（无）' }}
+            </p>
+          </div>
+        </div>
+        <p v-if="mergeDelivery.merge_todos.length" class="todo-list" data-testid="merge-todos">
+          <span v-for="(item, index) in mergeDelivery.merge_todos" :key="index" class="todo-item">
+            {{ item.todo }}
+          </span>
+        </p>
+        <p v-else class="page-desc">合并待办已清空，交付结论完整。</p>
+      </template>
+    </section>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -100,13 +233,17 @@ import {
   createEntry,
   downloadEntries,
   listEntries,
+  loadBackfillDetail,
+  loadMergeDelivery,
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
-import type { EntryRow } from '@/data/types'
+import type { BackfillDetail, EntryRow, MergeDelivery } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const isBackfill = meta.key === 'backfill_pipeline'
+const isBatchMerge = meta.key === 'batch_merge'
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -115,14 +252,29 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
-const stats = computed(() => [
-  { label: meta.metrics[0], value: total.value },
-  { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
-  {
-    label: meta.metrics[2],
-    value: rows.value.filter((row) => row.status === meta.statuses[meta.statuses.length - 1]).length,
-  },
-])
+const deliveryMode = ref('')
+const linkedBackfillId = ref('1')
+const backfillDetail = ref<BackfillDetail | null>(null)
+const mergeDelivery = ref<MergeDelivery | null>(null)
+const deliveryMessage = ref('')
+
+const stats = computed(() => {
+  if (isBackfill && backfillDetail.value) {
+    return [
+      { label: meta.metrics[0], value: total.value },
+      { label: '回填进度', value: `${backfillDetail.value.progress_percent}%` },
+      { label: '可用回填数据范围', value: backfillDetail.value.usable_backfill_range.join('、') || '（无）' },
+    ]
+  }
+  return [
+    { label: meta.metrics[0], value: total.value },
+    { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
+    {
+      label: meta.metrics[2],
+      value: rows.value.filter((row) => row.status === meta.statuses[meta.statuses.length - 1]).length,
+    },
+  ]
+})
 const statusSummary = computed(() =>
   meta.statuses.map((status) => ({
     status,
@@ -170,9 +322,28 @@ async function runAction(action: string, row: EntryRow) {
   try {
     const result = await applyAction(meta.key, Number(row.id), action)
     if (!result.ok) throw new Error(result.message)
+    if (isBackfill) await loadDelivery(Number(row.id))
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
+  }
+}
+
+async function loadDelivery(backfillId?: number) {
+  deliveryMessage.value = ''
+  backfillDetail.value = null
+  mergeDelivery.value = null
+  const mode = deliveryMode.value || undefined
+  try {
+    if (isBackfill) {
+      const id = backfillId ?? Number(rows.value[0]?.id ?? 1)
+      backfillDetail.value = await loadBackfillDetail(id, mode)
+    } else if (isBatchMerge) {
+      const mergeId = Number(rows.value[0]?.id ?? 1)
+      mergeDelivery.value = await loadMergeDelivery(mergeId, Number(linkedBackfillId.value) || 1, mode)
+    }
+  } catch (error) {
+    deliveryMessage.value = error instanceof Error ? error.message : '交付边界读取失败'
   }
 }
 
@@ -182,6 +353,7 @@ async function reload() {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    if (isBackfill) await loadDelivery()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
   }

@@ -77,5 +77,34 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 回填交付边界
+
+数据回填的进度、完成行数和“可用回填数据范围”都来自逐分区实际结果，
+纯计算逻辑集中在 `backend/app/backfill.py`，回填工作台与合并入口共用同一套口径：
+
+- 存在失败 / 无产出分区时进度不会显示 100%，失败分区只保留拒绝依据
+  （`basis=partition_result`），不计入完成行数；
+- 交付支持两种口径，且都拒绝无产出分区：
+  - 按分区交付：完整成功的分区立即交付，下一批读取范围就是这些分区；
+  - 整批确认：同批分区全部成功后才统一交付，否则成功分区也留在回填侧等待；
+- 两种口径同时出现时按优先级统一（整批确认 > 按分区交付），显式传入的口径
+  覆盖已存配置并标记 `mode_conflict`；
+- 回填状态只能 排队中→回填中→已完成/回填失败 逐级流转；失败恢复回到回填中，
+  已写入分区按台账保留，重复提交只记一次；可用范围为空的旧回填依据不会覆盖真实流记录。
+
+相关接口：
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/backfill/{id}/detail` | 回填详情：进度、可用范围、逐分区依据 |
+| `POST /api/backfill/{id}/execute` | 执行一批分区回填 |
+| `POST /api/backfill/{id}/recover` | 失败恢复（保留已写入分区） |
+| `POST /api/backfill/{id}/delivery-mode` | 设置交付口径 |
+| `GET /api/backfill/{id}/boundary` | 合并入口使用的交付边界与合并待办 |
+| `POST /api/backfill/merge/{merge_id}/evaluate` | 合并入口预览接收 / 拒绝范围 |
+
+`POST /api/chains/schema-evolve` 支持可选的 `delivery_mode` 参数，摘要会带上
+回填进度、可用范围、交付分区、留在回填侧的分区和合并待办。
+
 领域：数据工程
 子方向：数仓与数据湖

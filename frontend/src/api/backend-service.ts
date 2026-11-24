@@ -1,6 +1,13 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type {
+  ActionResult,
+  BackfillDetail,
+  EntryRow,
+  MergeDelivery,
+  OverviewResult,
+  PageResult,
+} from '@/data/types'
 
 export { moduleMeta }
 
@@ -58,4 +65,28 @@ export async function loadOverview(): Promise<OverviewResult> {
   const response = await request('/api/overview')
   if (!response.ok) throw new Error('运营概览读取失败')
   return await response.json()
+}
+
+export async function loadBackfillDetail(
+  backfillId: number,
+  deliveryMode?: string,
+): Promise<BackfillDetail> {
+  const query = deliveryMode ? `?${new URLSearchParams({ delivery_mode: deliveryMode })}` : ''
+  const response = await request(`/api/backfill/${backfillId}/detail${query}`)
+  if (!response.ok) throw new Error('回填详情读取失败')
+  return await response.json()
+}
+
+export async function loadMergeDelivery(
+  mergeId: number,
+  backfillId: number,
+  deliveryMode?: string,
+): Promise<MergeDelivery> {
+  const response = await request(`/api/backfill/merge/${mergeId}/evaluate`, {
+    method: 'POST',
+    body: JSON.stringify({ backfill_id: backfillId, delivery_mode: deliveryMode ?? null }),
+  })
+  const payload = await response.json()
+  if (!response.ok) throw new Error(payload?.detail ?? '合并入口交付边界读取失败')
+  return payload
 }
